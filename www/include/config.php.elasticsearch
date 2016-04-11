@@ -1,0 +1,7 @@
+	# START OF flamework-elasticsearch STUFF
+
+	$GLOBALS['cfg']['elasticsearch_host'] = 'localhost';
+	$GLOBALS['cfg']['elasticsearch_port'] = '9200';
+	$GLOBALS['cfg']['elasticsearch_http_timeout'] = 10;
+
+	# END OF flamework-elasticsearch STUFF

@@ -2,9 +2,13 @@
 
 	loadlib("http");
 
+	$GLOBALS['timing_keys']['es_queries'] = 'ElasticSearch Queries';
 	$GLOBALS['timings']['es_queries_count']	= 0;
 	$GLOBALS['timings']['es_queries_time']	= 0;
-	$GLOBALS['timing_keys']['es_queries'] = 'ElasticSearch Queries';
+
+	$GLOBALS['timing_keys']['es_mget'] = 'ElasticSearch Multi-GET requests';
+	$GLOBALS['timings']['es_mget_count']	= 0;
+	$GLOBALS['timings']['es_mget_time']	= 0;
 
 	########################################################################
 
@@ -43,12 +47,15 @@
 		$get_args = http_build_query($get_args);
 
 		$url = implode(":", array($more['host'], $more['port']));
-		if($more['index']) {
+
+		if ($more['index']){
 			$url .= "/{$more['index']}";
 		}
-		if($more['type']) {
+
+		if ($more['type']){
 			$url .= "/{$more['type']}";
 		}
+
 		$url .= "/_search?{$get_args}";
 
 		$body = json_encode($query);
@@ -67,6 +74,8 @@
 		$start = microtime_ms();
 
 		$rsp = http_post($url, $body, $headers, $http_more);
+
+		# dumper($rsp);
 
 		$end = microtime_ms();
 
@@ -109,21 +118,41 @@
 		));
 
 		$defaults = array(
-			'query' => $query_all
+			'query' => $query_all,
+			'search_type' => 'count',
+			'include_filter' => null,
+			'exclude_filter' => null,
 		);
 
 		$more = array_merge($defaults, $more);
 
-		$es_query = array(
-			'query' => $more['query'],
-			'aggregations' => array(
-				'facet' => array(
-					'terms' => array('field' => $field, 'size' => 0)
-				)
+		$aggrs = array(
+			'facet' => array(
+				'terms' => array('field' => $field, 'size' => 0)
 			)
 		);
 
+		if ($more['include_filter']){
+			$aggrs['facet']['terms']['include'] = $more['include_filter'];
+		}
+
+		if ($more['exlude_filter']){
+			$aggrs['facet']['terms']['exclude'] = $more['exclude_filter'];
+		}
+
+		$es_query = array(
+			'query' => $more['query'],
+			'aggregations' => $aggrs,
+		);
+
+		# $t1 = microtime_ms();
+
+		# dumper($es_query);
 		$rsp = elasticsearch_search($es_query, $more);
+		# dumper($rsp);
+
+		# $t2 = microtime_ms();
+		# dumper("search " . ($t2 - $t1));
 
 		if (! $rsp['ok']){
 			return $rsp;
@@ -146,6 +175,101 @@
 		$rows = $rsp['aggregations'];
 		
 		return array("ok" => 1, "rows" => $rows, "pagination" => $pagination);
+	}
+
+	########################################################################
+
+	# https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-multi-get.html
+
+	function elasticsearch_mget($ids, $more=array()){
+
+		$defaults = array(
+			'host' => $GLOBALS['cfg']['elasticsearch_host'],
+			'port' => $GLOBALS['cfg']['elasticsearch_port'],
+			'http_timeout' => $GLOBALS['cfg']['elasticsearch_http_timeout'],
+			# 'per_page' => $GLOBALS['cfg']['pagination_per_page'],
+			# 'page' => 1,
+			# 'index' => null,
+			# 'type' => null,
+			'fields' => null,
+		);
+
+		$more = array_merge($defaults, $more);
+
+		$query = array( 'ids' => $ids );
+
+		if ($fields = $more['fields']) {
+
+			$docs = array();
+
+			foreach ($ids as $id){
+
+				$docs[] = array(
+					'_id' => $id,
+					'_source' => $fields,
+				);
+			}
+
+			$query = array(
+				'docs' => $docs
+			);
+		}
+
+		$query = json_encode($query);
+
+		$url = implode(":", array($more['host'], $more['port']));
+
+		if ($more['index']){
+			$url .= "/{$more['index']}";
+		}
+
+		if ($more['type']){
+			$url .= "/{$more['type']}";
+		}
+
+		$url .= "/_mget";
+
+		$headers = array();
+
+		# dumper($url);
+		# dumper($query);
+
+		$http_more = array(
+			'http_timeout' => $more['http_timeout'],
+			'body' => $query
+		);
+
+		$start = microtime_ms();
+
+		$rsp = http_get($url, $headers, $http_more);
+
+		# dumper($rsp);
+
+		$end = microtime_ms();
+
+		$GLOBALS['timings']['es_mget_count'] += 1;
+		$GLOBALS['timings']['es_mget_time'] += $end-$start;
+
+		if (! $rsp['ok']){
+			return $rsp;
+		}
+
+		$data = json_decode($rsp['body'], 'as hash');
+
+		if (! $data){
+			return array('ok' => 0, 'error' => 'failed to decode JSON');
+		}
+
+		if ($data['error']){
+			return array('ok' => 0, 'error' => $data['error']);
+		}
+
+		$rows = elasticsearch_rowinate_mget_results($data);
+
+		return array(
+			'ok' => 1,
+			'rows' => $rows,
+		);
 	}
 
 	########################################################################
@@ -194,6 +318,19 @@
 		$rows = array();
 
 		foreach ($data['hits']['hits'] as $h){
+			$rows[] = $h['_source'];
+		}
+
+		return $rows;
+	}
+
+	########################################################################
+
+	function elasticsearch_rowinate_mget_results(&$data){
+
+		$rows = array();
+
+		foreach ($data['docs'] as $h){
 			$rows[] = $h['_source'];
 		}
 
@@ -504,6 +641,7 @@
 	########################################################################
 
 	function elasticsearch_paginate_aggregation_results($results, $more=array()) {
+
 		$page = isset($more['page']) ? max(1, $more['page']) : 1;
 		$per_page = isset($more['per_page']) ? max(1, $more['per_page']) : $GLOBALS['cfg']['pagination_per_page'];
 
@@ -531,4 +669,73 @@
 
 	########################################################################
 
+	function elasticsearch_escape($str){
+
+	        # If you need to use any of the characters which function as operators in
+        	# your query itself (and not as operators), then you should escape them
+	        # with a leading backslash. For instance, to search for (1+1)=2, you would
+        	# need to write your query as \(1\+1\)\=2.
+	        #
+        	# The reserved characters are: + - = && || > < ! ( ) { } [ ] ^ " ~ * ? : \ /
+	        #
+        	# Failing to escape these special characters correctly could lead to a
+	        # syntax error which prevents your query from running.
+		#
+		# A space may also be a reserved character. For instance, if you have a
+		# synonym list which converts "wi fi" to "wifi", a query_string search for
+		# "wi fi" would fail. The query string parser would interpret your query
+		# as a search for "wi OR fi", while the token stored in your index is
+		# actually "wifi". Escaping the space will protect it from being touched
+		# by the query string parser: "wi\ fi"
+		#
+		# https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-query-string-query.html
+
+		# note the absence of "&" and "|" which are handled separately
+
+		$to_escape = array(
+			"+", "-", "=", ">", "<", "!", "(", ")", "{", "}", "[", "]", "^", '"', "~", "*", "?", ":", "\\", "/"
+		);
+
+		$escaped = array();
+
+		# $chars = preg_split('/(?<!^)(?!$)/u', $str);
+
+		$chars = array();
+		$strlen = mb_strlen($str); 
+
+		while ($strlen) { 
+			$chars[] = mb_substr($str, 0, 1, "UTF-8"); 
+			$str = mb_substr($str, 1, $strlen, "UTF-8"); 
+			$strlen = mb_strlen($str); 
+		}
+
+		$count = count($chars);
+		$i = 0;
+		
+		foreach ($chars as $char){
+
+			if (in_array($char, $to_escape)){
+				$char = "\{$char}";
+			}
+
+			else if (in_array($char, array("&", "|"))){
+
+				if ((($i + 1) < $count) && ($chars[ $i + 1 ] == $char)){
+					$char = "\{$char}";
+				}
+			}
+			
+			else {
+				# pass
+			}
+
+			$escaped[] = $char;
+			$i++;
+		}
+
+		return implode("", $escaped);
+	}
+	
+	########################################################################
+	
 	# the end

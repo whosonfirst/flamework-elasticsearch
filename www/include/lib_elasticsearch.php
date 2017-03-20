@@ -23,9 +23,18 @@
 			'page' => 1,
 			'index' => null,
 			'type' => null,
+
+			'scroll' => $GLOBALS['cfg']['elasticsearch_scroll'],
+			'scroll_ttl' => $GLOBALS['cfg']['elasticsearch_scroll_ttl'],
+			'scroll_id' => null,
+			'cursor' => null,
 		);
 
 		$more = array_merge($defaults, $more);
+
+		if ((! $more["scroll_id"]) && ($more["cursor"])){
+			$more["scroll_id"] = $more["cursor"];
+		}
 
 		# http://www.elasticsearchtutorial.com/basic-elasticsearch-concepts.html
 		# The amount of time it took me to figure out that it's 'size' and 'from'
@@ -44,7 +53,80 @@
 			'search_type' => $more['search_type'],
 		);
 
-		$get_args = http_build_query($get_args);
+		$http_more = array(
+			'http_timeout' => $more['http_timeout'],
+		);
+
+		$body = json_encode($query);
+
+		$headers = array(
+			"Content-Type" => "application/x-www-form-urlencoded",
+		);
+
+		# I hate this... but basically a user shouldn't have to think about
+		# whether or not something will require a cursor so we check to see
+		# for them... because, computers... (20170227/thisisaaronland)
+
+		$pre_count = 0;
+
+		# Generally we want or need to precount things...
+
+		if ((! $more['scroll'])	|| ($page == 1)){
+			$pre_count = 1;
+		}
+
+		# But wait! There's more!! We _don't_ want to precount things
+		# if we're faceting because the scroll stuff confuses the faceting
+		# stuff. Because we can't have nice things...
+
+		if (isset($query["aggregations"])){
+			$more['scroll'] = 0;
+			$pre_count = 0;
+		}
+
+		if ($pre_count){
+
+			$_args = $get_args;
+			$_args['size'] = 0;
+
+			$_url = implode(":", array($more['host'], $more['port']));
+
+			if ($more['index']){
+				$_url .= "/{$more['index']}";
+			}
+
+			if ($more['type']){
+				$_url .= "/{$more['type']}";
+			}
+			
+			$_query = http_build_query($_args);
+			$_url .= "/_search?{$_query}";
+
+			$_rsp = http_post($_url, $body, $headers, $http_more);
+
+			if (! $_rsp['ok']){
+				return $_rsp;
+			}
+
+			$_data = json_decode($_rsp['body'], 'as hash');
+
+			if (! $_data){
+				return array('ok' => 0, 'error' => 'failed to decode JSON');
+			}
+
+			if ($_data['error']){
+				return array('ok' => 0, 'error' => $_data['error']);
+			}
+
+			$_hits = $_data["hits"];
+			$count = $_hits["total"];
+
+			if ($count > $GLOBALS['cfg']['elasticsearch_scroll_trigger']){
+				$more['scroll'] = 1;
+			}
+		}
+
+		# End of I hate this... for now 
 
 		$url = implode(":", array($more['host'], $more['port']));
 
@@ -56,26 +138,41 @@
 			$url .= "/{$more['type']}";
 		}
 
-		$url .= "/_search?{$get_args}";
+		# https://www.elastic.co/guide/en/elasticsearch/guide/current/scroll.html
 
-		$body = json_encode($query);
+		if (($more['scroll']) && ($more['scroll_id'])){
 
-		$headers = array(
-			"Content-Type" => "application/x-www-form-urlencoded",
-		);
+			$query = array(
+				"scroll" => $more['scroll_ttl'],
+				"scroll_id" => $more['scroll_id'],
+			);
 
-		# dumper($url);
-		# dumper($query);
+			$body = json_encode($query);
 
-		$http_more = array(
-			'http_timeout' => $more['http_timeout'],
-		);
+			# See the way we're removing the index? Yeah... that
+
+			$url = implode(":", array($more['host'], $more['port']));
+			$url .= "/_search/scroll";
+		}
+
+		else if ($more['scroll']){
+
+			$get_args["scroll"] = $more["scroll_ttl"];
+			$get_query = http_build_query($get_args);
+
+			$url .= "/_search/?{$get_query}"; 
+		}
+
+		else {
+
+			$get_query = http_build_query($get_args);
+
+			$url .= "/_search?{$get_query}";
+		}
 
 		$start = microtime_ms();
 
 		$rsp = http_post($url, $body, $headers, $http_more);
-
-		# dumper($rsp);
 
 		$end = microtime_ms();
 
@@ -102,8 +199,9 @@
 		$rsp['rows'] = $rows;
 		$rsp['pagination'] = $pagination;
 
-		log_notice('elasticsearch', $url . ' ' . $body . " HTTP {$rsp['info']['http_code']}", $rsp['info']['total_time']);
+		# log_notice('elasticsearch', $url . ' ' . $body . " HTTP {$rsp['info']['http_code']}", $rsp['info']['total_time']);
 
+		$rsp['_query'] = $query;
 		return $rsp;
 	}
 
@@ -147,12 +245,9 @@
 
 		# $t1 = microtime_ms();
 
-		# dumper($es_query);
 		$rsp = elasticsearch_search($es_query, $more);
-		# dumper($rsp);
 
 		# $t2 = microtime_ms();
-		# dumper("search " . ($t2 - $t1));
 
 		if (! $rsp['ok']){
 			return $rsp;
@@ -231,9 +326,6 @@
 
 		$headers = array();
 
-		# dumper($url);
-		# dumper($query);
-
 		# the following requires a copy of lib_http >= this commit:
 		# https://github.com/whosonfirst/flamework/commit/1c552608169c3cebedbd333efe71a5928eaac60a
 		# (20161031/thisisaaronland)
@@ -246,8 +338,6 @@
 		$start = microtime_ms();
 
 		$rsp = http_get($url, $headers, $http_more);
-
-		# dumper($rsp);
 
 		$end = microtime_ms();
 
@@ -355,6 +445,32 @@
 			'per_page' => $per_page,
 			'page_count' => $page_count,
 		);
+
+		if (isset($data["_scroll_id"])){
+
+			$cursor = $data["_scroll_id"];
+			$pagination["cursor"] = $cursor;
+
+			# Why do I have to do this? I thought the whole point of cursors
+			# was not to have to do this... (20170302/thisiarronland)
+
+			if (count($data['hits']['hits']) == 0){
+
+				# The other thing is that it's important this be an empty string
+				# and not a null value because the test for generating next_query
+				# in api_utils_ensure_pagination_results() is by testing whether
+				# 'if (isset($pagination['cursor'])){'. I'm not saying that's the
+				# best way to do it only that it's the way we do it today. If
+				# there's a better way then we should do that instead...
+				# (20170302/thisisaaronland)
+
+				$pagination["cursor"] = "";
+			}
+
+			if ($total_count <= $per_page){
+				unset($pagination["cursor"]);
+			}
+		}
 
 		return $pagination;
 	}
@@ -675,6 +791,10 @@
 
 	function elasticsearch_escape($str){
 
+		if (is_numeric($str)){
+			return intval($str);
+		}
+	
 	        # If you need to use any of the characters which function as operators in
         	# your query itself (and not as operators), then you should escape them
 	        # with a leading backslash. For instance, to search for (1+1)=2, you would
